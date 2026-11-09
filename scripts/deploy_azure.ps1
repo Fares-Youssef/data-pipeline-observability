@@ -38,12 +38,13 @@ param(
 )
 
 $ErrorActionPreference = 'Stop'
+$env:LOG_LEVEL = 'WARNING'
 $ProjectRoot = Split-Path -Parent $PSScriptRoot
 Set-Location $ProjectRoot
 $Python = Join-Path $ProjectRoot '.venv\Scripts\python.exe'
 
 function Step([string]$Message) { Write-Host "`n==> $Message" -ForegroundColor Cyan }
-function Az {
+function Invoke-Az {
     $output = & az @args
     if ($LASTEXITCODE -ne 0) { throw "Azure CLI failed: az $($args -join ' ')" }
     return $output
@@ -94,22 +95,22 @@ if (-not (Test-Path $Python)) { throw "Python not found at $Python" }
 if ($LASTEXITCODE -ne 0) { throw 'Unit tests failed' }
 & $Python weather_cli.py validate | Out-Host
 if ($LASTEXITCODE -ne 0) { throw 'Local database validation failed. Start MySQL in XAMPP first.' }
-Az extension add --name containerapp --upgrade --only-show-errors | Out-Null
-$Subscription = Az account show --query name -o tsv
+if (-not (Exists { az extension show --name containerapp })) { Invoke-Az extension add --name containerapp --only-show-errors | Out-Null }
+$Subscription = Invoke-Az account show --query name -o tsv
 Write-Host "Subscription: $Subscription | Region: $Location | Image tag: $Tag"
 
 # ---------------------------------------------------------------- 1. providers
 Step 'Registering resource providers (one-time)'
 foreach ($p in 'Microsoft.ContainerRegistry', 'Microsoft.App', 'Microsoft.OperationalInsights', 'Microsoft.DBforMySQL',
                 'Microsoft.Storage', 'Microsoft.Insights', 'Microsoft.Synapse') {
-    if ((az provider show -n $p --query registrationState -o tsv) -ne 'Registered') { Az provider register -n $p --wait | Out-Null }
+    if ((az provider show -n $p --query registrationState -o tsv) -ne 'Registered') { Invoke-Az provider register -n $p --wait | Out-Null }
     Write-Host "  $p registered"
 }
-if (-not (Exists { az group show -n $ResourceGroup })) { Az group create -n $ResourceGroup -l $Location | Out-Null }
+if (-not (Exists { az group show -n $ResourceGroup })) { Invoke-Az group create -n $ResourceGroup -l $Location | Out-Null }
 
 # ---------------------------------------------------------------- 2. registry + image
 Step "Container registry and image $Image"
-if (-not (Exists { az acr show -n $AcrName })) { Az acr create -g $ResourceGroup -n $AcrName --sku Basic -l $Location | Out-Null }
+if (-not (Exists { az acr show -n $AcrName })) { Invoke-Az acr create -g $ResourceGroup -n $AcrName --sku Basic -l $Location | Out-Null }
 if (Exists { az acr repository show -n $AcrName --image "depi-weather:$Tag" }) {
     Write-Host '  image already built'
 } else {
@@ -127,28 +128,28 @@ if (Exists { az acr repository show -n $AcrName --image "depi-weather:$Tag" }) {
 # ---------------------------------------------------------------- 3. storage (data lake)
 Step "Data lake storage $StorageAccount (ADLS Gen2)"
 if (-not (Exists { az storage account show -g $ResourceGroup -n $StorageAccount })) {
-    Az storage account create -g $ResourceGroup -n $StorageAccount -l $Location --sku Standard_LRS --kind StorageV2 `
+    Invoke-Az storage account create -g $ResourceGroup -n $StorageAccount -l $Location --sku Standard_LRS --kind StorageV2 `
         --hns true --min-tls-version TLS1_2 --allow-blob-public-access false | Out-Null
 }
-$StorageConnection = Az storage account show-connection-string -g $ResourceGroup -n $StorageAccount --query connectionString -o tsv
+$StorageConnection = Invoke-Az storage account show-connection-string -g $ResourceGroup -n $StorageAccount --query connectionString -o tsv
 foreach ($c in 'weather-raw', 'lake', 'synapse') {
-    Az storage container create -n $c --connection-string $StorageConnection --only-show-errors | Out-Null
+    Invoke-Az storage container create -n $c --connection-string $StorageConnection --only-show-errors | Out-Null
 }
 
 # ---------------------------------------------------------------- 4. MySQL
 Step "Azure Database for MySQL $DbServer"
 $MyIp = (Invoke-RestMethod -Uri 'https://api.ipify.org')
 if (-not (Exists { az mysql flexible-server show -g $ResourceGroup -n $DbServer })) {
-    Az mysql flexible-server create -g $ResourceGroup -n $DbServer -l $Location --tier Burstable --sku-name Standard_B1ms `
+    Invoke-Az mysql flexible-server create -g $ResourceGroup -n $DbServer -l $Location --tier Burstable --sku-name Standard_B1ms `
         --storage-size 20 --version 8.0.21 --admin-user $State.DbAdminUser --admin-password $State.DbAdminPassword `
         --public-access $MyIp --backup-retention 7 --yes | Out-Null
 }
-Az mysql flexible-server firewall-rule create -g $ResourceGroup -n $DbServer --rule-name allow-azure-services `
+Invoke-Az mysql flexible-server firewall-rule create -g $ResourceGroup -n $DbServer --rule-name allow-azure-services `
     --start-ip-address 0.0.0.0 --end-ip-address 0.0.0.0 --only-show-errors | Out-Null
-Az mysql flexible-server firewall-rule create -g $ResourceGroup -n $DbServer --rule-name deploy-client `
+Invoke-Az mysql flexible-server firewall-rule create -g $ResourceGroup -n $DbServer --rule-name deploy-client `
     --start-ip-address $MyIp --end-ip-address $MyIp --only-show-errors | Out-Null
 if (-not (Exists { az mysql flexible-server db show -g $ResourceGroup -s $DbServer -d depi })) {
-    Az mysql flexible-server db create -g $ResourceGroup -s $DbServer -d depi --charset utf8mb4 --collation utf8mb4_unicode_ci | Out-Null
+    Invoke-Az mysql flexible-server db create -g $ResourceGroup -s $DbServer -d depi --charset utf8mb4 --collation utf8mb4_unicode_ci | Out-Null
 }
 
 # ---------------------------------------------------------------- 5. copy data
@@ -166,12 +167,12 @@ if (-not $SkipDataCopy) {
 # ---------------------------------------------------------------- 6. logs + environment
 Step 'Log Analytics + Container Apps environment'
 if (-not (Exists { az monitor log-analytics workspace show -g $ResourceGroup -n $Workspace })) {
-    Az monitor log-analytics workspace create -g $ResourceGroup -n $Workspace -l $Location --retention-time 30 | Out-Null
+    Invoke-Az monitor log-analytics workspace create -g $ResourceGroup -n $Workspace -l $Location --retention-time 30 | Out-Null
 }
-$WorkspaceId = Az monitor log-analytics workspace show -g $ResourceGroup -n $Workspace --query customerId -o tsv
-$WorkspaceKey = Az monitor log-analytics workspace get-shared-keys -g $ResourceGroup -n $Workspace --query primarySharedKey -o tsv
+$WorkspaceId = Invoke-Az monitor log-analytics workspace show -g $ResourceGroup -n $Workspace --query customerId -o tsv
+$WorkspaceKey = Invoke-Az monitor log-analytics workspace get-shared-keys -g $ResourceGroup -n $Workspace --query primarySharedKey -o tsv
 if (-not (Exists { az containerapp env show -g $ResourceGroup -n $EnvName })) {
-    Az containerapp env create -g $ResourceGroup -n $EnvName -l $Location --logs-workspace-id $WorkspaceId --logs-workspace-key $WorkspaceKey | Out-Null
+    Invoke-Az containerapp env create -g $ResourceGroup -n $EnvName -l $Location --logs-workspace-id $WorkspaceId --logs-workspace-key $WorkspaceKey | Out-Null
 }
 
 # ---------------------------------------------------------------- 7. app + jobs
@@ -190,25 +191,25 @@ $Registry = @('--registry-server', "$AcrName.azurecr.io", '--registry-identity',
 
 Step 'API / dashboard: depi-weather-api'
 if (Exists { az containerapp show -g $ResourceGroup -n depi-weather-api }) {
-    Az containerapp secret set -g $ResourceGroup -n depi-weather-api --secrets @Secrets | Out-Null
-    Az containerapp update -g $ResourceGroup -n depi-weather-api --image $Image --set-env-vars @Vars | Out-Null
+    Invoke-Az containerapp secret set -g $ResourceGroup -n depi-weather-api --secrets @Secrets | Out-Null
+    Invoke-Az containerapp update -g $ResourceGroup -n depi-weather-api --image $Image --set-env-vars @Vars | Out-Null
 } else {
-    Az containerapp create -g $ResourceGroup -n depi-weather-api --environment $EnvName --image $Image @Registry `
+    Invoke-Az containerapp create -g $ResourceGroup -n depi-weather-api --environment $EnvName --image $Image @Registry `
         --target-port 8000 --ingress external --cpu 0.5 --memory 1Gi --min-replicas 0 --max-replicas 2 `
         --secrets @Secrets --env-vars @Vars | Out-Null
 }
-$Fqdn = Az containerapp show -g $ResourceGroup -n depi-weather-api --query properties.configuration.ingress.fqdn -o tsv
+$Fqdn = Invoke-Az containerapp show -g $ResourceGroup -n depi-weather-api --query properties.configuration.ingress.fqdn -o tsv
 
 function Set-Job([string]$Name, [string]$Trigger, [string]$Cron, [string[]]$CliArgs, [int]$Timeout) {
     Write-Host "  job $Name"
     if (Exists { az containerapp job show -g $ResourceGroup -n $Name }) {
-        Az containerapp job secret set -g $ResourceGroup -n $Name --secrets @Secrets | Out-Null
-        Az containerapp job update -g $ResourceGroup -n $Name --image $Image --set-env-vars @Vars | Out-Null
+        Invoke-Az containerapp job secret set -g $ResourceGroup -n $Name --secrets @Secrets | Out-Null
+        Invoke-Az containerapp job update -g $ResourceGroup -n $Name --image $Image --set-env-vars @Vars | Out-Null
         return
     }
     $schedule = @('--trigger-type', $Trigger)
     if ($Trigger -eq 'Schedule') { $schedule += @('--cron-expression', $Cron) }
-    Az containerapp job create -g $ResourceGroup -n $Name --environment $EnvName --image $Image @Registry @schedule `
+    Invoke-Az containerapp job create -g $ResourceGroup -n $Name --environment $EnvName --image $Image @Registry @schedule `
         --replica-timeout $Timeout --replica-retry-limit 1 --parallelism 1 --replica-completion-count 1 `
         --cpu 1 --memory 2Gi --secrets @Secrets --env-vars @Vars --command python --args @CliArgs | Out-Null
 }
@@ -219,8 +220,8 @@ Set-Job 'depi-backfill' 'Schedule' '0 14 * * *' @('weather_cli.py', 'backfill-ac
 
 function Invoke-Ops([string]$Command, [int]$TimeoutMinutes = 60) {
     Write-Host "  depi-ops> $Command" -ForegroundColor Yellow
-    Az containerapp job update -g $ResourceGroup -n depi-ops --set-env-vars "DEPI_COMMAND=$Command" | Out-Null
-    $execution = Az containerapp job start -g $ResourceGroup -n depi-ops --query name -o tsv
+    Invoke-Az containerapp job update -g $ResourceGroup -n depi-ops --set-env-vars "DEPI_COMMAND=$Command" | Out-Null
+    $execution = Invoke-Az containerapp job start -g $ResourceGroup -n depi-ops --query name -o tsv
     $deadline = (Get-Date).AddMinutes($TimeoutMinutes)
     do {
         Start-Sleep -Seconds 20
@@ -252,13 +253,13 @@ if ($WithSynapse) {
     Step 'Synapse workspace (serverless SQL over the lake)'
     $Synapse = "depi-syn-$Suffix"
     if (-not (Exists { az synapse workspace show -g $ResourceGroup -n $Synapse })) {
-        Az synapse workspace create -g $ResourceGroup -n $Synapse -l $Location --storage-account $StorageAccount `
+        Invoke-Az synapse workspace create -g $ResourceGroup -n $Synapse -l $Location --storage-account $StorageAccount `
             --file-system synapse --sql-admin-login-user sqladminuser --sql-admin-login-password $State.SynapseSqlPassword | Out-Null
     }
-    Az synapse workspace firewall-rule create -g $ResourceGroup --workspace-name $Synapse -n deploy-client `
+    Invoke-Az synapse workspace firewall-rule create -g $ResourceGroup --workspace-name $Synapse -n deploy-client `
         --start-ip-address $MyIp --end-ip-address $MyIp --only-show-errors | Out-Null
-    $principal = Az synapse workspace show -g $ResourceGroup -n $Synapse --query identity.principalId -o tsv
-    $storageId = Az storage account show -g $ResourceGroup -n $StorageAccount --query id -o tsv
+    $principal = Invoke-Az synapse workspace show -g $ResourceGroup -n $Synapse --query identity.principalId -o tsv
+    $storageId = Invoke-Az storage account show -g $ResourceGroup -n $StorageAccount --query id -o tsv
     & az role assignment create --assignee-object-id $principal --assignee-principal-type ServicePrincipal `
         --role 'Storage Blob Data Reader' --scope $storageId --only-show-errors 2>$null | Out-Null
     (Get-Content synapse\01_serverless_lake_views.sql -Raw).Replace('__STORAGE_ACCOUNT__', $StorageAccount) |
