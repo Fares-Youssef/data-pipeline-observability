@@ -16,13 +16,49 @@ def statements(text: str):
             yield statement
 
 
+_ADD_COLUMN = re.compile(r"^ALTER\s+TABLE\s+(\w+)\s+ADD\s+COLUMN\s+IF\s+NOT\s+EXISTS\s+(\w+)\s", re.I | re.S)
+_CREATE_INDEX = re.compile(r"^CREATE\s+(UNIQUE\s+)?INDEX\s+IF\s+NOT\s+EXISTS\s+(\w+)\s+ON\s+(\w+)", re.I | re.S)
+
+
+def mysql_statement(statement: str, exists) -> str | None:
+    """Translate MariaDB-only idempotent DDL to MySQL 8.
+
+    MySQL 8 has no ``ADD COLUMN IF NOT EXISTS`` / ``CREATE INDEX IF NOT EXISTS``; the existence check is done
+    through ``exists(kind, table, name)`` instead. Returns None when the statement must be skipped.
+    The geometry column also gets ``SRID 4326`` so MySQL can use the spatial index for ST_Intersects.
+    """
+    match = _ADD_COLUMN.match(statement)
+    if match:
+        table, column = match.groups()
+        return None if exists("column", table, column) else re.sub(r"\s+IF\s+NOT\s+EXISTS", "", statement, count=1, flags=re.I)
+    match = _CREATE_INDEX.match(statement)
+    if match:
+        _, index, table = match.groups()
+        return None if exists("index", table, index) else re.sub(r"\s+IF\s+NOT\s+EXISTS", "", statement, count=1, flags=re.I)
+    return re.sub(r"(\bgeometry\s+GEOMETRY\s+NOT\s+NULL)(?!\s+SRID)", r"\1 SRID 4326", statement, flags=re.I)
+
+
 def apply_migrations(settings: Settings) -> None:
     migration_dir = Path(__file__).resolve().parents[1] / "migrations"
     connection = connect(settings)
     cur = connection.cursor()
+
+    def exists(kind: str, table: str, name: str) -> bool:
+        source = "COLUMNS" if kind == "column" else "STATISTICS"
+        field = "COLUMN_NAME" if kind == "column" else "INDEX_NAME"
+        cur.execute(f"SELECT COUNT(*) FROM information_schema.{source} "
+                    f"WHERE TABLE_SCHEMA=DATABASE() AND TABLE_NAME=%s AND {field}=%s", (table, name))
+        return cur.fetchone()[0] > 0
+
     try:
+        cur.execute("SELECT VERSION()")
+        is_mariadb = "mariadb" in cur.fetchone()[0].lower()
         for migration in sorted(migration_dir.glob("*.sql")):
             for statement in statements(migration.read_text(encoding="utf-8")):
+                if not is_mariadb:
+                    statement = mysql_statement(statement, exists)
+                    if statement is None:
+                        continue
                 cur.execute(statement)
         connection.commit()
     except Exception:

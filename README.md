@@ -36,6 +36,31 @@ The dashboard and JSON API are at `http://127.0.0.1:5000`. See [AZURE_DEPLOYMENT
 
 For the complete Arabic production checklist, use [AZURE_CHECKLIST_AR.md](AZURE_CHECKLIST_AR.md). Run `powershell -ExecutionPolicy Bypass -File .\scripts\preflight.ps1` before every deployment and `python scripts\verify_deployment.py https://<app-fqdn>` after deployment.
 
+## Phase 3: data lake, quality, orchestration and CI/CD
+
+```powershell
+python weather_cli.py stations --align      # comparison eligibility policy (station <= 50 km, QC passed)
+python weather_cli.py quality-check         # robust z-score / run-to-run anomaly detection
+python weather_cli.py export-lake           # Silver + Gold Parquet (local "lake" or Azure Data Lake)
+python weather_cli.py report                # Matplotlib/Seaborn charts in reports\<date>
+powershell -ExecutionPolicy Bypass -File .\scripts\deploy_azure.ps1 -WithSynapse   # full Azure deployment
+```
+
+`run-batch` now runs: forecasts -> observations -> alignment -> quality-check -> export-lake.
+Sampling points are collected in priority order (governorates, districts, cities, then neighbourhoods), so
+`WEATHER_MAX_LOCATIONS=1500` keeps the free Open-Meteo tier under 5,000 calls/hour.
+
+| Folder | Purpose |
+|---|---|
+| `weather/lake.py` | Medallion export (Bronze raw archive, Silver typed tables, Gold accuracy/disagreement) |
+| `weather/quality.py` | Statistical anomaly detection written to `weather_quality_issues` |
+| `synapse/` | Serverless SQL pool views and analysis queries over the lake |
+| `spark/` | PySpark accuracy job for a Synapse Spark pool |
+| `airflow/dags/` | Equivalent Airflow DAG |
+| `.github/workflows/` | CI (tests) and CD (build image, roll out app/jobs) |
+| `monitoring/` | KQL queries and Azure Monitor alert script |
+| `scripts/copy_database.py` | MariaDB -> Azure MySQL 8 copy with geometry/axis-order conversion and verification |
+
 ## Windows setup
 
 These commands assume PowerShell opened in the project folder.

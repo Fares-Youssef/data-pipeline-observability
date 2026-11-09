@@ -3,6 +3,8 @@ from __future__ import annotations
 import argparse
 import json
 import logging
+import os
+import shlex
 import sys
 from datetime import date, datetime, timedelta
 from pathlib import Path
@@ -219,7 +221,10 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 def main() -> int:
-    args = build_parser().parse_args()
+    # Container jobs can pass the command through DEPI_COMMAND (e.g. "collect-forecasts --limit 5"),
+    # which avoids quoting dash-prefixed arguments in `az containerapp job update --args`.
+    argv = sys.argv[1:] or shlex.split(os.getenv("DEPI_COMMAND", ""))
+    args = build_parser().parse_args(argv)
     settings = Settings()
     logging.basicConfig(level=settings.log_level, format="%(asctime)s %(levelname)s %(name)s %(message)s")
     repository = WeatherRepository(settings)
