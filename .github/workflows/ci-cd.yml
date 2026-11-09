@@ -1,0 +1,64 @@
+# CI/CD for DEPI Weather (Module 8: DevOps & CI/CD).
+# CI  : every push / pull request -> install, compile, unit tests.
+# CD  : push to main -> build image in Azure Container Registry, roll out API + scheduled jobs.
+# Setup: create a federated (OIDC) app registration with Contributor on the resource group and
+# AcrPush on the registry, then add repository secrets AZURE_CLIENT_ID, AZURE_TENANT_ID, AZURE_SUBSCRIPTION_ID.
+name: ci-cd
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  id-token: write
+  contents: read
+
+env:
+  RESOURCE_GROUP: rg-depi-weather
+  ACR_NAME: depiweather56232c7d
+  IMAGE_NAME: depi-weather
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+          cache: pip
+      - run: pip install -r requirements.txt
+      - run: python -m compileall -q app.py weather weather_cli.py scripts spark airflow
+      - run: python -m pytest -q
+
+  deploy:
+    needs: test
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    environment: production
+    steps:
+      - uses: actions/checkout@v4
+      - uses: azure/login@v2
+        with:
+          client-id: ${{ secrets.AZURE_CLIENT_ID }}
+          tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+          subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+      - name: Build and push image
+        run: |
+          az acr login --name "$ACR_NAME"
+          IMAGE="$ACR_NAME.azurecr.io/$IMAGE_NAME:${GITHUB_SHA::12}"
+          docker build --platform linux/amd64 -t "$IMAGE" .
+          docker push "$IMAGE"
+          echo "IMAGE=$IMAGE" >> "$GITHUB_ENV"
+      - name: Roll out API and jobs
+        run: |
+          az containerapp update -g "$RESOURCE_GROUP" -n depi-weather-api --image "$IMAGE"
+          for job in depi-forecast depi-backfill depi-ops; do
+            az containerapp job update -g "$RESOURCE_GROUP" -n "$job" --image "$IMAGE"
+          done
+      - name: Smoke test
+        run: |
+          FQDN=$(az containerapp show -g "$RESOURCE_GROUP" -n depi-weather-api --query properties.configuration.ingress.fqdn -o tsv)
+          python scripts/verify_deployment.py "https://$FQDN"

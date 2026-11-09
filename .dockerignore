@@ -1,0 +1,16 @@
+.git
+.env
+.venv
+.deps
+__pycache__
+.pytest_cache
+*.pyc
+*.png
+data/downloads
+data/checkpoints
+raw-weather
+backups
+*.sql
+lake
+reports
+.github

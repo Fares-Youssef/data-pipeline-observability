@@ -1,0 +1,19 @@
+// Log Analytics queries for the DEPI Container Apps environment (Module 8: Monitoring & Debugging).
+
+// 1) Failed job executions in the last day
+ContainerAppSystemLogs_CL
+| where TimeGenerated > ago(1d)
+| where JobName_s startswith "depi-" and Reason_s in ("BackoffLimitExceeded", "Failed", "DeadlineExceeded")
+| project TimeGenerated, JobName_s, Reason_s, Log_s
+
+// 2) Pipeline errors written by weather_cli.py (stdout/stderr)
+ContainerAppConsoleLogs_CL
+| where TimeGenerated > ago(1d)
+| where ContainerJobName_s startswith "depi-" and Log_s has_any ("ERROR", "Traceback", "rate_limited", "HTTP 429")
+| project TimeGenerated, ContainerJobName_s, Log_s
+
+// 3) Daily collection summary lines
+ContainerAppConsoleLogs_CL
+| where TimeGenerated > ago(7d)
+| where Log_s has "\"status\": \"complete\"" or Log_s has "\"status\": \"partial\""
+| project TimeGenerated, ContainerJobName_s, Log_s

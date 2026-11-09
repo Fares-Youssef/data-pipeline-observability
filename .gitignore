@@ -1,0 +1,16 @@
+.env
+.venv/
+.deps/
+__pycache__/
+.pytest_cache/
+*.py[cod]
+data/downloads/
+data/checkpoints/
+coverage.json
+raw-weather/
+*.log
+.azure/
+backups/
+*.sql
+lake/
+reports/
