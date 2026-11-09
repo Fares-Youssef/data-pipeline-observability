@@ -11,11 +11,13 @@ Layout (local folder ``LAKE_ROOT`` and, when configured, the Azure Data Lake con
     silver/dim_station/dim_station.parquet
     silver/fact_forecast/issue_date=YYYY-MM-DD/part-0.parquet
     silver/fact_observation/observation_month=YYYY-MM/part-0.parquet
-    gold/forecast_error/target_month=YYYY-MM/part-0.parquet
-    gold/model_accuracy/model_accuracy.parquet
+    gold/forecast_error/issue_date=YYYY-MM-DD/part-0.parquet
+    gold/model_accuracy/model_accuracy.parquet          (rolling window, default 30 days)
     gold/model_disagreement/issue_date=YYYY-MM-DD/part-0.parquet
 
-Every partition is fully rewritten on each export, so re-running is idempotent.
+Only complete partitions inside the window are rewritten (filtering is by issue date), so re-running is
+idempotent and older partitions are never truncated. Observation partitions are monthly and the window
+reaches back far enough to rewrite whole months that it touches.
 """
 from __future__ import annotations
 
@@ -190,14 +192,15 @@ def export_lake(settings: Settings, days: int = 30, writer: LakeWriter | None = 
                        "f.target_date,f.lead_days,f.temperature_max_c,f.temperature_min_c,p.latitude,p.longitude "
                        "FROM weather_daily_forecasts f JOIN weather_forecast_runs r ON r.id=f.forecast_run_id "
                        "JOIN weather_models m ON m.id=r.model_id JOIN weather_sampling_points p ON p.id=f.sampling_point_id "
-                       "WHERE f.target_date >= %s", (since,))
+                       # Filter on issue date so every issue_date partition written is complete.
+                       "WHERE DATE_SUB(f.target_date, INTERVAL f.lead_days DAY) >= %s", (since,))
     forecasts = clean_forecasts(forecasts)
     if not forecasts.empty:
         forecasts = forecasts.merge(point_governorate, on="sampling_point_id", how="left")
     observations = _frame(settings,
                           "SELECT station_id,observation_date,temperature_max_c obs_max_c,temperature_min_c obs_min_c,"
                           "quality_flags,temporal_alignment FROM weather_daily_observations "
-                          "WHERE is_current=1 AND observation_date >= %s", (since - timedelta(days=15),))
+                          "WHERE is_current=1 AND observation_date >= %s", (since.replace(day=1),))
     if not observations.empty:
         observations["observation_date"] = pd.to_datetime(observations["observation_date"]).dt.date
         for column in ("obs_max_c", "obs_min_c"):
@@ -219,8 +222,7 @@ def export_lake(settings: Settings, days: int = 30, writer: LakeWriter | None = 
     files += writer.write_partitioned(forecasts, "silver/fact_forecast", "issue_date")
     files += writer.write_partitioned(observations, "silver/fact_observation", "observation_month")
     if not errors.empty:
-        errors = errors.assign(target_month=pd.to_datetime(errors["target_date"]).dt.strftime("%Y-%m"))
-        files += writer.write_partitioned(errors, "gold/forecast_error", "target_month")
+        files += writer.write_partitioned(errors, "gold/forecast_error", "issue_date")
     files += writer.write_partitioned(disagreement, "gold/model_disagreement", "issue_date")
     return {
         "status": "complete", "window_days": days, "files_written": len(files),

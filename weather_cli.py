@@ -302,7 +302,7 @@ def main() -> int:
             module_name, function_name = step.split(":")
             try:
                 module = __import__(module_name, fromlist=[function_name])
-                emit({"step": label, **getattr(module, function_name)(settings)})
+                emit({"step": label, **getattr(module, function_name)(settings, 14)})
             except Exception:
                 logging.exception("Post-processing step failed", extra={"step": label})
                 post_code = 1

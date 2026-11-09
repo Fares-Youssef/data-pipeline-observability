@@ -210,7 +210,7 @@ function Set-Job([string]$Name, [string]$Trigger, [string]$Cron, [string[]]$CliA
     if ($Trigger -eq 'Schedule') { $schedule += @('--cron-expression', $Cron) }
     Az containerapp job create -g $ResourceGroup -n $Name --environment $EnvName --image $Image @Registry @schedule `
         --replica-timeout $Timeout --replica-retry-limit 1 --parallelism 1 --replica-completion-count 1 `
-        --cpu 0.5 --memory 1Gi --secrets @Secrets --env-vars @Vars --command python --args @CliArgs | Out-Null
+        --cpu 1 --memory 2Gi --secrets @Secrets --env-vars @Vars --command python --args @CliArgs | Out-Null
 }
 Step 'Jobs'
 Set-Job 'depi-ops' 'Manual' '' @('weather_cli.py') 7200
