@@ -16,17 +16,6 @@ powershell -ExecutionPolicy Bypass -File .\scripts\preflight.ps1
 
 يجب أن تنجح الاختبارات، migration، وفحص قاعدة البيانات. يجب أن يظهر Azure CLI كمتاح. Docker Engine مطلوب فقط للبناء المحلي؛ يمكن أن يظل `False` عند استخدام `az acr build`.
 
-### حالة Docker الحالية على هذا الجهاز
-
-Docker Desktop 4.84.0 يفشل عند إنشاء AF_UNIX sockets الخاصة بـ `dockerInference` و`docker-secrets-engine`. WSL 2.7.11 والـ hypervisor يعملان؛ المشكلة في نسخة Docker Desktop الحالية. لا تستخدم **Reset to factory defaults**.
-
-1. حدّث Docker Desktop إلى إصدار أحدث (صفحة الإصدارات الرسمية تعرض 4.94.0 بتاريخ 5 أكتوبر 2026) أو أعد تثبيته بنمط per-user وWSL 2.
-2. أعد تشغيل Windows إذا طلب المثبت ذلك.
-3. شغّل `docker info` ثم `docker build -t depi-weather:local .`.
-4. بعد نجاح Docker فقط، يمكن حذف النسختين الاحتياطيتين يدويًا:
-   - `%LOCALAPPDATA%\Docker\run-stale-20261031`
-   - `%LOCALAPPDATA%\docker-secrets-engine-stale-20261031`
-
 يمكن تجاوز Docker المحلي بالكامل باستخدام `az acr build` بعد تثبيت Azure CLI؛ البناء يتم داخل Azure.
 
 لتثبيت Azure CLI رسميًا عبر WinGet:

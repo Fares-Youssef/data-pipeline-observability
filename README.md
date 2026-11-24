@@ -1,186 +1,264 @@
-# DEPI Weather Analytics & Forecast Accuracy Platform
+# Data Quality & Pipeline Observability Platform
 
-A local Flask + MySQL/MariaDB reverse-geocoder backed only by imported polygon data. It never turns point labels into fictional boundaries and returns explicit coverage gaps.
+### Weather Forecast Verification for Egypt
 
-## What is included
+**A production-oriented Data Engineering graduation project | Digital Egypt Pioneers Initiative (DEPI) — Team 2**
 
-- Safe, additive geography tables with source/release metadata, hierarchy links, multilingual names, bounding boxes, SRID 4326 geometry, and a spatial index.
-- A resumable, chunked geoBoundaries `gbOpen` importer for one country or all available countries.
-- Database-native reverse lookup using a numeric bounding-box prefilter plus `ST_Intersects` (covers border points).
-- An interactive Leaflet map with manual coordinate entry, RTL-safe local names, raw JSON, and clear verified/uncovered states.
-- Health, schema audit, coverage reporting, and API tests.
+![Python](https://img.shields.io/badge/Python-3.13-3776AB?logo=python&logoColor=white)
+![Flask](https://img.shields.io/badge/Flask-API-000000?logo=flask)
+![MySQL](https://img.shields.io/badge/MySQL%20%2F%20MariaDB-spatial-4479A1?logo=mysql&logoColor=white)
+![Airflow](https://img.shields.io/badge/Apache%20Airflow-DAG-017CEE?logo=apacheairflow&logoColor=white)
+![Spark](https://img.shields.io/badge/PySpark-Gold%20layer-E25A1C?logo=apachespark&logoColor=white)
+![Azure](https://img.shields.io/badge/Azure-Container%20Apps%20%7C%20ADLS%20%7C%20Synapse-0078D4?logo=microsoftazure&logoColor=white)
+![Tests](https://img.shields.io/badge/tests-25%20passing-2ea44f)
 
-Phase 2 extends the preserved Phase 1 geography with nationwide sampling, immutable model-specific forecast snapshots, measured station observations, accuracy-safe comparisons, a bilingual dashboard, and Azure-ready worker commands.
+---
 
-## Phase 2 quick start
+## Overview
+
+Weather providers revise their predictions continuously. If you compare *today's* forecast with what actually
+happened, you get a misleading accuracy score, because the forecast that was really issued days earlier has been
+overwritten. On top of that, real-world weather data arrives with missing values, mixed units, wrong
+station/coordinate matches, API failures and silent revisions.
+
+This platform solves that with a **reliable, observable data pipeline** that:
+
+1. **Collects** daily forecasts (D+1 … D+10) from three explicitly identified global models —
+   **NOAA GFS**, **ECMWF IFS** and **ECMWF AIFS** — for thousands of locations across Egypt.
+2. **Preserves every forecast as an immutable snapshot**, so the prediction made 10, 5 or 1 day(s) ahead is never
+   overwritten.
+3. **Ingests measured station observations** (NOAA GHCN-Daily) and keeps every revision.
+4. **Validates data quality** at every stage — schema/unit checks, plausibility rules, duplicate protection and
+   statistical anomaly detection.
+5. **Pairs forecasts with observations fairly** (same day, same lead time, eligible station within 50 km, QC passed)
+   and computes **MAE, RMSE and bias** per model, lead time and governorate.
+6. **Makes the pipeline observable** — every run, batch, retry, failure and quality issue is recorded and exposed
+   through an API, a dashboard, log queries and alerts.
+7. **Publishes a medallion data lake** (Bronze → Silver → Gold Parquet) for Synapse SQL, PySpark and reports.
+
+> The project proposal and requirements are in
+> [`docs/project-proposal-and-requirements.pdf`](docs/project-proposal-and-requirements.pdf).
+> What was actually built versus what was proposed is tracked in
+> [`docs/10-requirements-traceability.md`](docs/10-requirements-traceability.md).
+
+---
+
+## Architecture
+
+```mermaid
+flowchart LR
+    subgraph Sources
+        OM["Open-Meteo API<br/>GFS · IFS · AIFS"]
+        GH["NOAA GHCN-Daily<br/>station observations"]
+        OV["Overture Maps<br/>Egypt boundaries"]
+    end
+
+    subgraph Pipeline["Pipeline (weather_cli.py)"]
+        C1["collect-forecasts<br/>retry · rate limit · lease lock"]
+        C2["collect-actuals<br/>revision tracking"]
+        AL["alignment policy<br/>station ≤ 50 km, QC passed"]
+        QC["quality-check<br/>robust z-score · run-to-run jumps"]
+        EX["export-lake"]
+    end
+
+    subgraph Storage
+        DB[("MySQL / MariaDB<br/>immutable snapshots<br/>pipeline runs · quality issues")]
+        BR["Bronze<br/>raw gzip JSON"]
+        LK["Silver / Gold<br/>Parquet"]
+    end
+
+    subgraph Consumers
+        API["Flask API + dashboard"]
+        SY["Synapse serverless SQL"]
+        SP["PySpark job"]
+        RP["Matplotlib / Seaborn report"]
+        MON["Log Analytics + alerts"]
+    end
+
+    OV --> DB
+    OM --> C1 --> DB
+    C1 --> BR
+    GH --> C2 --> DB
+    DB --> AL --> QC --> EX --> LK
+    DB --> API
+    LK --> SY & SP & RP
+    C1 & C2 & QC -. logs / run status .-> MON
+```
+
+Orchestration is provided two ways that call the **same idempotent CLI commands**:
+**Apache Airflow** (`airflow/dags/depi_weather_daily`) and **Azure Container Apps Jobs** (production).
+
+Full details: [`docs/01-architecture.md`](docs/01-architecture.md).
+
+---
+
+## Key Features
+
+### Data quality
+| Check | Where | Behaviour |
+|---|---|---|
+| Schema & unit validation | `weather/providers/open_meteo.py` | Rejects payloads that aren't °C, have mismatched array lengths or an incomplete D+1…D+10 horizon |
+| Duplicate protection | Unique keys in `migrations/` | Re-running the same window inserts **0** rows (`INSERT IGNORE` / natural keys) |
+| Plausibility & consistency | `weather/lake.py` (Silver) | −30…60 °C range, `Tmax ≥ Tmin`; invalid rows are flagged `is_valid = false`, not deleted |
+| Cross-model outliers | `weather/quality.py` | Robust z-score (median / MAD) against the other models |
+| Run-to-run jumps | `weather/quality.py` | Same model/point/target changes > 8 °C between consecutive runs |
+| Observation QC | `weather/repository.py` | GHCN QC flags honoured; failed QC → `incompatible`, never used for scoring |
+| Referential integrity | Foreign keys | Forecast → run → model → source; observation → station; match → station + point |
+
+### Reliability
+- Bounded retries with exponential backoff, explicit HTTP 429 handling and `Retry-After` support.
+- Per-request throttling to stay inside the free Open-Meteo quota.
+- **Lease-based locking** (`lock_key` + heartbeat + expiry) so two workers can never process the same model/day,
+  and a crashed worker is recovered safely with `weather_cli.py recover --expired`.
+- Batch-level checkpoints: a failed batch is isolated and recorded; the rest of the run continues (`partial` status).
+- Raw responses archived content-addressed (SHA-256) for replay and audit.
+
+### Observability
+- `weather_pipeline_runs` / `weather_pipeline_batches`: status, counts (processed / inserted / duplicates / failed),
+  attempts, errors, checkpoints.
+- `weather_quality_issues`: every anomaly with severity, message and JSON details.
+- `/api/pipeline/status`, `/api/pipeline/runs`, `/api/ready` endpoints + the dashboard's monitoring panel.
+- Azure Log Analytics KQL queries and an e-mail alert on any job error (`monitoring/`).
+
+---
+
+## Tech Stack
+
+| Layer | Technology |
+|---|---|
+| Language | Python 3.13 |
+| Storage | MySQL 8 / MariaDB (spatial, SRID 4326), Azure Database for MySQL Flexible Server |
+| Data processing | Pandas, NumPy, PyArrow (Parquet), PySpark |
+| Orchestration | Apache Airflow DAG, Azure Container Apps Jobs (cron) |
+| API / UI | Flask + Gunicorn, Chart.js dashboard (English / Arabic) |
+| Data lake & analytics | Azure Data Lake Storage Gen2, Azure Synapse serverless SQL, Synapse Spark |
+| Visualisation | Matplotlib, Seaborn |
+| Monitoring | Azure Monitor / Log Analytics (KQL), scheduled-query alerts |
+| DevOps | Docker, Azure Container Registry, GitHub Actions (CI + CD with OIDC) |
+| Testing | pytest (25 tests) |
+
+---
+
+## Quick Start (local)
 
 ```powershell
+# 1. Environment
+py -m venv .venv
+.\.venv\Scripts\Activate.ps1
+pip install -r requirements.txt
+Copy-Item .env.example .env          # set DB_USER / DB_PASSWORD
+
+# 2. Database + geography
 python weather_cli.py init-db
+python scripts\import_geography.py --reset     # Egypt boundaries from Overture Maps
+
+# 3. Pipeline
 python weather_cli.py locations --sync
-python weather_cli.py locations --status
 python weather_cli.py stations --discover
 python weather_cli.py stations --match
 python weather_cli.py collect-forecasts --limit 5
 python weather_cli.py collect-actuals --limit 5
-python weather_cli.py backfill-actuals --lookback-days 45
+python weather_cli.py stations --align
+python weather_cli.py quality-check
+python weather_cli.py export-lake
+python weather_cli.py report
+
+# 4. Check & serve
 python weather_cli.py validate
-python weather_cli.py status
-python app.py
-```
-
-`collect-forecasts` requests D0 through D+10 in `Africa/Cairo` and stores only the standard D+1 through D+10 comparison horizon. GFS, IFS, and AIFS are explicit model identifiers and never Best Match. A repeated identical logical run is idempotent. Use `--location-id`, `--model`, `--date`, `--batch-size`, `--limit`, and `--dry-run` for controlled testing.
-
-`run-batch` is intended for an hourly UTC Azure trigger. It proceeds only during the 09:00 `Africa/Cairo` hour, so Egypt daylight-saving changes do not require a fixed-offset assumption. Use `--force` only for operator-initiated runs.
-
-The dashboard and JSON API are at `http://127.0.0.1:5000`. See [AZURE_DEPLOYMENT.md](AZURE_DEPLOYMENT.md) for deployment, scheduling, TLS, backup, monitoring, and capacity guidance, and [PROVIDER_AND_COVERAGE.md](PROVIDER_AND_COVERAGE.md) for verified model identifiers and measured coverage.
-
-For the complete Arabic production checklist, use [AZURE_CHECKLIST_AR.md](AZURE_CHECKLIST_AR.md). Run `powershell -ExecutionPolicy Bypass -File .\scripts\preflight.ps1` before every deployment and `python scripts\verify_deployment.py https://<app-fqdn>` after deployment.
-
-## Phase 3: data lake, quality, orchestration and CI/CD
-
-```powershell
-python weather_cli.py stations --align      # comparison eligibility policy (station <= 50 km, QC passed)
-python weather_cli.py quality-check         # robust z-score / run-to-run anomaly detection
-python weather_cli.py export-lake           # Silver + Gold Parquet (local "lake" or Azure Data Lake)
-python weather_cli.py report                # Matplotlib/Seaborn charts in reports\<date>
-powershell -ExecutionPolicy Bypass -File .\scripts\deploy_azure.ps1 -WithSynapse   # full Azure deployment
-```
-
-`run-batch` now runs: forecasts -> observations -> alignment -> quality-check -> export-lake.
-Sampling points are collected in priority order (governorates, districts, cities, then neighbourhoods), so
-`WEATHER_MAX_LOCATIONS=1500` keeps the free Open-Meteo tier under 5,000 calls/hour.
-
-| Folder | Purpose |
-|---|---|
-| `weather/lake.py` | Medallion export (Bronze raw archive, Silver typed tables, Gold accuracy/disagreement) |
-| `weather/quality.py` | Statistical anomaly detection written to `weather_quality_issues` |
-| `synapse/` | Serverless SQL pool views and analysis queries over the lake |
-| `spark/` | PySpark accuracy job for a Synapse Spark pool |
-| `airflow/dags/` | Equivalent Airflow DAG |
-| `.github/workflows/` | CI (tests) and CD (build image, roll out app/jobs) |
-| `monitoring/` | KQL queries and Azure Monitor alert script |
-| `scripts/copy_database.py` | MariaDB -> Azure MySQL 8 copy with geometry/axis-order conversion and verification |
-
-## Windows setup
-
-These commands assume PowerShell opened in the project folder.
-
-1. Start the MySQL/MariaDB server behind phpMyAdmin (for example, start **MySQL** in the XAMPP control panel). phpMyAdmin itself is not used by this application.
-
-2. Create a dedicated database account in MySQL/MariaDB. Grant it access only to `depi`. A database administrator can adapt the following example; choose a strong password rather than copying a placeholder:
-
-   ```sql
-   CREATE DATABASE IF NOT EXISTS depi CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci;
-   CREATE USER IF NOT EXISTS 'depi_app'@'localhost' IDENTIFIED BY 'choose-a-strong-password';
-   GRANT SELECT, INSERT, UPDATE, CREATE, ALTER, INDEX, REFERENCES ON depi.* TO 'depi_app'@'localhost';
-   FLUSH PRIVILEGES;
-   ```
-
-3. Create the Python environment and install dependencies:
-
-   ```powershell
-   py -m venv .venv
-   .\.venv\Scripts\Activate.ps1
-   python -m pip install -r requirements.txt
-   Copy-Item .env.example .env
-   ```
-
-   This workspace may also contain a `.deps` directory created during automated verification. When present, the supplied entry points automatically use it for ordinary commands such as `python app.py`. A normal virtual environment remains the recommended reproducible setup.
-
-4. Edit `.env`. Set `DB_USER` and `DB_PASSWORD`; adjust host/port if the server is not on `127.0.0.1:3306`. `.env` is ignored by Git.
-
-5. Audit existing tables **before** migration:
-
-   ```powershell
-   python scripts\audit_db.py | Tee-Object audit-before.json
-   ```
-
-6. Apply the idempotent additive migration:
-
-   ```powershell
-   python scripts\migrate.py
-   ```
-
-   If `depi` does not exist and the configured account has server-level create permission, use `python scripts\migrate.py --create-database` once.
-
-## Import data
-
-The recommended importer now uses Overture Maps divisions for detailed administrative, locality, and neighborhood polygons. With no scope argument it imports Egypt at every published detail level:
-
-```powershell
-python scripts\migrate.py
-python scripts\import_geography.py --reset
-```
-
-`--reset` clears only the four geography tables and preserves every unrelated table in `depi`. Later refreshes are idempotent and do not need reset:
-
-```powershell
-python scripts\import_geography.py
-python scripts\import_geography.py --refresh
-```
-
-Egypt coverage is filtered to country code `EG` from Overture's current release and can include country, region, county, localadmin, locality, borough, macrohood, neighborhood, and microhood polygons where the source publishes them. Missing subtypes remain explicit; the importer never converts point-only Places records into fake boundaries.
-
-Repeat the same command to verify idempotency: `inserted=0` is expected for an unchanged release. Geometry rows are keyed by source release plus official Overture feature ID; changed source geometry updates that same record.
-
-Global import is deliberately explicit because it can take substantial disk space and time:
-
-```powershell
-python scripts\import_world.py
-```
-
-That explicit command imports Overture's complete global divisions theme and writes local counts to `coverage.json`. It is substantially larger than Egypt-only import. Run it again after an interruption; database upserts do not create duplicates. Use `python scripts\import_world.py --skip-migration` only when desired.
-
-The underlying configurable form remains available:
-
-```powershell
-python scripts\import_geography.py --all --batch-size 250
-```
-
-Downloads are streamed to `data\downloads`, retry transient HTTP errors, and resume a partial file with HTTP Range where supported. Database progress is committed every batch and recorded in `geo_import_job`. Re-running is the recovery mechanism after interruption. Use `--levels 0,1,2,3,4,5` only when those deeper boundaries are actually needed; availability differs by country.
-
-## Run and verify
-
-```powershell
 python -m pytest -q
-python scripts\coverage_report.py | Tee-Object coverage.json
-python app.py
+python app.py                         # http://127.0.0.1:5000
 ```
 
-Open <http://127.0.0.1:5000>. Useful checks:
+Step-by-step guide: [`docs/08-local-setup.md`](docs/08-local-setup.md).
+Azure deployment: [`docs/09-azure-deployment.md`](docs/09-azure-deployment.md).
 
-```powershell
-Invoke-RestMethod http://127.0.0.1:5000/api/health
-Invoke-RestMethod 'http://127.0.0.1:5000/api/reverse?lat=30.0444&lon=31.2357'
+---
+
+## Repository Structure
+
+```
+├── app.py                      Flask API + dashboard entry point
+├── weather_cli.py              Pipeline CLI (every job is a sub-command)
+├── index.html                  Dashboard (Chart.js, English/Arabic)
+├── weather/                    Weather pipeline package
+│   ├── providers/open_meteo.py   Forecast adapter (explicit models, retries, rate limits)
+│   ├── observations.py           NOAA GHCN-Daily station adapter
+│   ├── repository.py             Database access, pipeline runs/leases, accuracy SQL
+│   ├── quality.py                Statistical anomaly detection
+│   ├── lake.py                   Bronze/Silver/Gold Parquet export
+│   ├── archive.py                Raw-response archive (local or Azure Blob)
+│   ├── analytics.py              MAE / RMSE / bias helpers
+│   └── report.py                 Matplotlib/Seaborn charts
+├── geo/                        Geography package (config, DB, reverse geocoding)
+├── migrations/                 Versioned, idempotent SQL schema (001–004)
+├── scripts/                    Geography import, migration, DB copy, Azure deploy, verification
+├── airflow/dags/               Apache Airflow DAG
+├── spark/                      PySpark accuracy job
+├── synapse/                    Synapse serverless SQL views + analysis queries
+├── monitoring/                 KQL queries + Azure Monitor alert script
+├── tests/                      pytest suite
+├── .github/workflows/          CI/CD pipeline
+├── Dockerfile                  Runtime image (API + jobs)
+└── docs/                       Detailed documentation
 ```
 
-For temporary lookup diagnostics, set `REVERSE_DIAGNOSTICS=true` in `.env` and restart Flask. Passwords are never returned by the API or deliberately logged.
+---
 
-After the Egypt import, manually/test-check Cairo `(30.0444,31.2357)`, Giza `(30.0131,31.2089)`, Alexandria `(31.2001,29.9187)`, Aswan `(24.0889,32.8998)`, and Marsa Matrouh `(31.3543,27.2373)`. Also test an uncovered ocean point such as `(0,-140)`, border points, and invalid ranges. Names must match stored `geo_unit` rows; the application contains no coordinate-to-name lookup table.
+## Documentation
 
-## Schema and lookup notes
+| # | Document | Contents |
+|---|---|---|
+| — | [Project proposal & requirements (PDF)](docs/project-proposal-and-requirements.pdf) | Original proposal, literature review, FR/NFR, acceptance tests |
+| 01 | [Architecture](docs/01-architecture.md) | Components, data flow, design principles |
+| 02 | [Data model](docs/02-data-model.md) | Every table, keys, provenance and immutability rules |
+| 03 | [Pipeline & orchestration](docs/03-pipeline-and-orchestration.md) | CLI commands, run-batch flow, Airflow DAG, locking, retries |
+| 04 | [Data quality](docs/04-data-quality.md) | All validation layers and anomaly detectors |
+| 05 | [Observability & monitoring](docs/05-observability-and-monitoring.md) | Run tracking, health endpoints, KQL, alerts, recovery |
+| 06 | [Data lake & analytics](docs/06-data-lake-and-analytics.md) | Medallion layout, accuracy metrics, Synapse, Spark, reports |
+| 07 | [API & dashboard](docs/07-api-and-dashboard.md) | REST endpoints with examples |
+| 08 | [Local setup](docs/08-local-setup.md) | Windows/XAMPP setup, geography import, configuration |
+| 09 | [Azure deployment](docs/09-azure-deployment.md) | One-command deployment, jobs, CI/CD, cost & capacity |
+| 10 | [Requirements traceability](docs/10-requirements-traceability.md) | Proposal requirements → implementation status |
+| 11 | [Sources & coverage](docs/11-sources-and-coverage.md) | Providers, licensing, measured geographic coverage |
+| AR | [نظرة عامة بالعربي](docs/ar/project-overview-ar.md) · [دليل Azure](docs/ar/azure-checklist-ar.md) | Arabic documentation |
 
-- `geo_source`: source, version, licensing, attribution, and original layer metadata.
-- `geo_unit`: source identity, hierarchy, names, ISO-like codes, centroid/representative point, bbox, and Polygon/MultiPolygon geometry.
-- `geo_name`: language/script-aware official, local, and alias names when a source supplies them.
-- `geo_import_job`: import status and checkpoints.
+---
 
-Longitude is X and latitude is Y everywhere: `POINT(lon lat)`. Data is stored with SRID 4326. `ST_Intersects` intentionally includes border points; if overlapping polygons match at one level, the stable result order prefers the smallest known area and then record ID. The API exposes all selected matches and the source attribution.
+## Project Team
 
-The geoBoundaries importer uses a polygon representative point to establish an ADM*n* → ADM*n-1* relationship and stores the method as `spatial_containment`. It never assigns an exact neighborhood from a centroid. Source-native parent identifiers should take priority in a future Overture importer.
+| Member | Workstream |
+|---|---|
+| Habiba Mohamed Ahmed Ali | Forecast providers and observation connectors |
+| Sameh Mohamed El-Araby Mohamed | ETL orchestration and API reliability |
+| Fares Youssef Ali Youssef | Versioned database model and forecast verification |
+| Mohamed Ramadan Fathy Mohamed | Monitoring, dashboards and alerts |
+| Mahmoud Abdel-Sabour Bayoumi Sweilem | Travel scoring, testing and reporting |
+| Alaa Ibrahim El-Saeed El-Hariry | Team coordination, research and documentation |
 
-## Data licensing and attribution
+---
 
-The importer stores each layer's returned license, original source URL, release/build date, and complete metadata. geoBoundaries requires attribution and its component datasets can carry different licenses. Review stored `geo_source.metadata_json` and the upstream license before redistribution. OpenStreetMap map tiles have their own attribution and usage policy; they are for interactive display, not bulk downloading.
+## Project Status
 
-## Phase 2 data-safety rules
+✅ **Core pipeline implemented, tested and deployable to Azure.**
 
-Keep weather facts separate from geography and separate observations from forecasts:
+- Implemented: forecast collection (3 models), immutable snapshots, station observations, alignment policy,
+  data-quality checks, accuracy metrics, data lake, Airflow DAG, Spark/Synapse analytics, dashboard, monitoring,
+  CI/CD.
+- Accuracy results become meaningful as eligible station observations accumulate — forecasts are collected
+  prospectively, so no back-tested numbers are claimed.
+- Not yet implemented from the proposal: travel-season recommendations (Aswan report), Prometheus/Grafana
+  (replaced by Azure Monitor), optional aviation module. See
+  [requirements traceability](docs/10-requirements-traceability.md).
 
-- `weather_sources` and `weather_models` preserve provider, distributor, organization, licensing, and exact model identity.
-- `weather_daily_observations` and `weather_observation_revisions` preserve measured station values and corrections.
-- `weather_forecast_runs` stores live or archived run metadata without pretending collection time is initialization time.
-- `weather_daily_forecasts` stores point/date/lead facts once per immutable run.
+## Data Sources & Licensing
 
-Never update an old forecast with a newer run. Store every snapshot so `(model, run, valid date, point)` can later be compared with observations. Values are normalized to Celsius, timestamps are UTC, and calendar-day calculations use Africa/Cairo. A response SHA-256 is retained locally; configure Blob Storage before nationwide production to archive compressed raw payloads.
+Forecasts: NOAA GFS and ECMWF IFS/AIFS via [Open-Meteo](https://open-meteo.com/en/terms) (free tier is
+non-commercial). Observations: [NOAA NCEI GHCN-Daily](https://www.ncei.noaa.gov/products/land-based-station/global-historical-climatology-network-daily).
+Boundaries: [Overture Maps Divisions](https://docs.overturemaps.org/) (ODbL / OpenStreetMap-derived).
+See [`docs/11-sources-and-coverage.md`](docs/11-sources-and-coverage.md).
 
+## Acknowledgment
+
+Developed as part of the **Digital Egypt Pioneers Initiative (DEPI)** graduation requirements, applying Data
+Engineering, workflow orchestration, data reliability and observability concepts to a practical,
+production-oriented system.

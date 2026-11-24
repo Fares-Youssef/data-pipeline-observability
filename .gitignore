@@ -12,5 +12,8 @@ raw-weather/
 .azure/
 backups/
 *.sql
+# ...but the schema migrations and Synapse scripts are source code
+!migrations/*.sql
+!synapse/*.sql
 lake/
 reports/
