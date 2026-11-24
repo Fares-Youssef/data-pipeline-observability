@@ -46,7 +46,8 @@ $Python = Join-Path $ProjectRoot '.venv\Scripts\python.exe'
 function Step([string]$Message) { Write-Host "`n==> $Message" -ForegroundColor Cyan }
 function Invoke-Az {
     $output = & az @args
-    if ($LASTEXITCODE -ne 0) { throw "Azure CLI failed: az $($args -join ' ')" }
+    # Never echo the full command: it can contain secrets (--secrets, passwords, connection strings).
+    if ($LASTEXITCODE -ne 0) { throw "Azure CLI failed: az $(($args | Select-Object -First 3) -join ' ') ... (see the error above)" }
     return $output
 }
 function Exists([scriptblock]$Probe) {
@@ -102,7 +103,7 @@ Write-Host "Subscription: $Subscription | Region: $Location | Image tag: $Tag"
 # ---------------------------------------------------------------- 1. providers
 Step 'Registering resource providers (one-time)'
 foreach ($p in 'Microsoft.ContainerRegistry', 'Microsoft.App', 'Microsoft.OperationalInsights', 'Microsoft.DBforMySQL',
-                'Microsoft.Storage', 'Microsoft.Insights', 'Microsoft.Synapse') {
+                'Microsoft.Storage', 'Microsoft.Insights', 'Microsoft.Synapse', 'Microsoft.Sql') {
     if ((az provider show -n $p --query registrationState -o tsv) -ne 'Registered') { Invoke-Az provider register -n $p --wait | Out-Null }
     Write-Host "  $p registered"
 }
@@ -171,8 +172,15 @@ if (-not (Exists { az monitor log-analytics workspace show -g $ResourceGroup -n 
 }
 $WorkspaceId = Invoke-Az monitor log-analytics workspace show -g $ResourceGroup -n $Workspace --query customerId -o tsv
 $WorkspaceKey = Invoke-Az monitor log-analytics workspace get-shared-keys -g $ResourceGroup -n $Workspace --query primarySharedKey -o tsv
+$old = $ErrorActionPreference; $ErrorActionPreference = 'Continue'
+$existingMode = az containerapp env show -g $ResourceGroup -n $EnvName --query properties.environmentMode -o tsv --only-show-errors 2>$null
+$ErrorActionPreference = $old
+if ($existingMode -eq 'Express') { throw "Environment $EnvName is in Express mode; delete it (az containerapp env delete) and re-run." }
 if (-not (Exists { az containerapp env show -g $ResourceGroup -n $EnvName })) {
-    Invoke-Az containerapp env create -g $ResourceGroup -n $EnvName -l $Location --logs-workspace-id $WorkspaceId --logs-workspace-key $WorkspaceKey | Out-Null
+    # WorkloadProfiles (Consumption profile): newer CLI versions default to "Express", which supports
+    # neither managed identity for registry pulls nor all job features.
+    Invoke-Az containerapp env create -g $ResourceGroup -n $EnvName -l $Location --environment-mode WorkloadProfiles `
+        --logs-workspace-id $WorkspaceId --logs-workspace-key $WorkspaceKey | Out-Null
 }
 
 # ---------------------------------------------------------------- 7. app + jobs
@@ -213,7 +221,23 @@ function Set-Job([string]$Name, [string]$Trigger, [string]$Cron, [string[]]$CliA
         --replica-timeout $Timeout --replica-retry-limit 1 --parallelism 1 --replica-completion-count 1 `
         --cpu 1 --memory 2Gi --secrets @Secrets --env-vars @Vars --command python --args @CliArgs | Out-Null
 }
-Step 'Jobs'
+Step 'Jobs (user-assigned identity with AcrPull, created before the jobs)'
+# A job's system identity only exists after creation, but creation already validates the image pull.
+# A user-assigned identity granted AcrPull up front avoids that chicken-and-egg failure.
+if (-not (Exists { az identity show -g $ResourceGroup -n depi-pull-identity })) {
+    Invoke-Az identity create -g $ResourceGroup -n depi-pull-identity -l $Location | Out-Null
+}
+$PullIdentityId = Invoke-Az identity show -g $ResourceGroup -n depi-pull-identity --query id -o tsv
+$PullPrincipal = Invoke-Az identity show -g $ResourceGroup -n depi-pull-identity --query principalId -o tsv
+$AcrId = Invoke-Az acr show -n $AcrName --query id -o tsv
+$hasRole = Invoke-Az role assignment list --assignee $PullPrincipal --scope $AcrId --role AcrPull --query "[].id" -o tsv
+if (-not $hasRole) {
+    Invoke-Az role assignment create --assignee-object-id $PullPrincipal --assignee-principal-type ServicePrincipal `
+        --role AcrPull --scope $AcrId | Out-Null
+    Write-Host '  waiting 60s for the AcrPull role assignment to propagate'
+    Start-Sleep -Seconds 60
+}
+$Registry = @('--registry-server', "$AcrName.azurecr.io", '--registry-identity', $PullIdentityId, '--mi-user-assigned', $PullIdentityId)
 Set-Job 'depi-ops' 'Manual' '' @('weather_cli.py') 7200
 Set-Job 'depi-forecast' 'Schedule' '0 * * * *' @('weather_cli.py', 'run-batch') 7200
 Set-Job 'depi-backfill' 'Schedule' '0 14 * * *' @('weather_cli.py', 'backfill-actuals') 3600
@@ -225,7 +249,9 @@ function Invoke-Ops([string]$Command, [int]$TimeoutMinutes = 60) {
     $deadline = (Get-Date).AddMinutes($TimeoutMinutes)
     do {
         Start-Sleep -Seconds 20
-        $status = az containerapp job execution show -g $ResourceGroup -n depi-ops --job-execution-name $execution --query properties.status -o tsv 2>$null
+        $old = $ErrorActionPreference; $ErrorActionPreference = 'Continue'
+        $status = az containerapp job execution show -g $ResourceGroup -n depi-ops --job-execution-name $execution --query properties.status -o tsv --only-show-errors 2>$null
+        $ErrorActionPreference = $old
         Write-Host "    $execution : $status"
     } while ($status -in @('Running', 'Processing', '') -and (Get-Date) -lt $deadline)
     $old = $ErrorActionPreference; $ErrorActionPreference = 'Continue'
@@ -260,8 +286,10 @@ if ($WithSynapse) {
         --start-ip-address $MyIp --end-ip-address $MyIp --only-show-errors | Out-Null
     $principal = Invoke-Az synapse workspace show -g $ResourceGroup -n $Synapse --query identity.principalId -o tsv
     $storageId = Invoke-Az storage account show -g $ResourceGroup -n $StorageAccount --query id -o tsv
+    $old = $ErrorActionPreference; $ErrorActionPreference = 'Continue'
     & az role assignment create --assignee-object-id $principal --assignee-principal-type ServicePrincipal `
         --role 'Storage Blob Data Reader' --scope $storageId --only-show-errors 2>$null | Out-Null
+    $ErrorActionPreference = $old
     (Get-Content synapse\01_serverless_lake_views.sql -Raw).Replace('__STORAGE_ACCOUNT__', $StorageAccount) |
         Set-Content -Encoding utf8 (Join-Path $StateDir 'synapse_views_ready.sql')
     Write-Host "  Open https://web.azuresynapse.net (workspace $Synapse) > Develop > SQL script > Built-in,"
